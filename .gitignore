@@ -1,0 +1,38 @@
+# The MatViz3D clone, a separate repository (docs/INSTALL.md)
+/MatViz3D/
+
+# Corpora, downloaded weights, the compiled solver driver and run output
+/data/
+/weights/
+/build/
+/checkpoints/
+/logs/
+/scratch/
+*.hdf5
+*.h5
+*.npz
+*.pt
+mesh_refine
+*.o
+*.so
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+.venv/
+venv/
+.env
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

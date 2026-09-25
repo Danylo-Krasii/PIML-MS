@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "piml"
+version = "0.1.0"
+description = "Physics-encoded surrogates for stress localization in 3D polycrystals"
+readme = "README.md"
+# Tested on Python 3.12; torch 2.3.1 has no wheel for 3.13.
+requires-python = ">=3.11,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Danylo Krasiy", email = "krasiydm@gmail.com" }]
+# Pinned to the versions the recorded runs used.
+dependencies = [
+    "numpy==1.26.4",
+    "scipy==1.13.1",
+    "h5py==3.16.0",
+    "matplotlib==3.9.0",
+]
+
+[project.optional-dependencies]
+# torch 2.3.1, as on record. Pick one: cu118 for training on an NVIDIA GPU, cpu for inference,
+# scoring and data generation.
+cu118 = ["torch==2.3.1"]
+cpu = ["torch==2.3.1"]
+dev = ["ruff>=0.5", "pytest>=8.0"]
+
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "cu118" }]]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu118", extra = "cu118" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 110
+src = ["src"]
+
+[tool.ruff.lint]
+ignore = ["E501", "E741"]
