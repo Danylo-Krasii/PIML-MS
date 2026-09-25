@@ -1,85 +1,95 @@
 # Convolutional stress localization in 3D polycrystals
 
-A convolutional network reads the elastic stiffness $\mathbf{C}(\mathbf{x})$ of every voxel of a periodic cubic polycrystal and predicts its stress-localization tensor $\mathbf{A}(\mathbf{x})$, a $6\times6$ matrix per voxel that gives the local stress under any macroscopic strain $\bar{\mathbf{E}}$:
+Predicts the stress-localization tensor $\mathbf{A}(\mathbf{x})$ of a periodic cubic polycrystal from the stiffness $\mathbf{C}(\mathbf{x})$ of its voxels, so the local stress under any macroscopic strain $\bar{\mathbf{E}}$ comes from one forward pass instead of an FFT solve:
 
 $$\boldsymbol{\sigma}(\mathbf{x}) = \mathbf{A}(\mathbf{x}) : \bar{\mathbf{E}}$$
 
-One prediction takes a fraction of a second on a CPU and replaces six FFT solves.
+Includes 34 trained checkpoints for $32^3$ volumes of three cubic materials, the training code and the tools that regenerate the training data.
 
-The repository holds the code, 34 trained checkpoints and the tools that regenerate the training data. The volumes are periodic cubes of $32^3$ voxels with 1,638 grains. The three materials share $c_{11}$ and $c_{12}$ and differ in $c_{44}$, which sets the anisotropy through the Zener ratio $2c_{44}/(c_{11}-c_{12})$: copper at 3.21 and two synthetic crystals at 5 and 8. For each material there is a linear network (no activation) and a nonlinear one (LeakyReLU), both with a receptive field of 13 voxels, each trained plain and through an equilibrium projection (`-proj`), a Fourier-space step that makes the predicted stress satisfy equilibrium.
+## Installation
 
-## Layout
-
-```
-src/piml/   the Python package; each tool runs as python -m piml.<module>
-tools/      the solver driver, its build script and the corpus regeneration guide
-docs/       installation, inference, data format
-```
-
-Git ignores `weights/` and `data/`, which you download, and `MatViz3D/`, `build/`, `scratch/`, `logs/` and `checkpoints/`, which data generation and training create.
-
-## Quick start
-
-Install [uv](https://docs.astral.sh/uv/), then the pinned environment (Python 3.12, torch 2.3.1, CPU build):
+See [docs/INSTALL.md](docs/INSTALL.md). In short:
 
 ```bash
-git clone https://github.com/Danylo-Krasii/PIML-MS.git
-cd PIML-MS
-uv sync --extra cpu
+uv sync --extra cpu          # --extra cu118 for training on an NVIDIA GPU
 source .venv/bin/activate
 ```
 
-Download the 34 checkpoints (81 MB) from the [weights folder](https://drive.google.com/drive/folders/1FDNxVCaYF80uvH8Wv0MCziz28GSd__Eu) into `weights/`, and `sve_1160.hdf5` (5 MB) from the [example folder](https://drive.google.com/drive/folders/1RESub45cO6zhZbLnvxgWqiB0FYih34LK) into `data/example/`. Then predict $\mathbf{A}(\mathbf{x})$ for the example volume:
+Download the checkpoints from the [weights folder](https://drive.google.com/drive/folders/1FDNxVCaYF80uvH8Wv0MCziz28GSd__Eu) into `weights/` and the example volume from the [example folder](https://drive.google.com/drive/folders/1RESub45cO6zhZbLnvxgWqiB0FYih34LK) into `data/example/`.
 
-```bash
-python -m piml.infer --ckpt weights/cu-nonlinear-rf13-w64-s0-proj.pt --input data/example/sve_1160.hdf5
-```
+## Running
 
-It prints the shape of $\mathbf{A}$, whether the projection ran and, since the example file carries the solver's $\mathbf{A}$, the relative error against it. To apply 100 MPa of uniaxial stress along x and plot the stress:
+> Every tool runs from the repository root as `python -m piml.<module>`; `--help` lists its arguments.
+
+### Inference
 
 ```bash
 python -m piml.infer --ckpt weights/cu-nonlinear-rf13-w64-s0-proj.pt --input data/example/sve_1160.hdf5 --load uniaxial-stress-x 100e6 --plot scratch/sve_1160
 ```
 
-[docs/INFERENCE.md](docs/INFERENCE.md) covers loads, plots, your own volumes and the Python API. [docs/INSTALL.md](docs/INSTALL.md) covers GPU and data-generation setup, [docs/DATA.md](docs/DATA.md) the file formats, and [tools/README.md](tools/README.md) corpus regeneration.
+Checkpoints are named `<corpus>-<arm>-rf13-w64-s<seed>[-proj].pt`: corpus `cu` (copper), `z5` or `z8` (Zener ratio 5 and 8), arm `linear` or `nonlinear`, and `-proj` when trained through the equilibrium projection. Use the corpus of your volume's material; a nonlinear `-proj` checkpoint is the default choice. The checkpoints expect volumes like the training ones: $32^3$ voxels, about 20 voxels per grain.
 
-## Checkpoints
+Optional arguments:
 
-Names follow `<corpus>-<arm>-rf13-w64-s<seed>[-proj].pt`, with corpus `cu`, `z5` or `z8`, arm `linear` or `nonlinear`, and seeds 0 to 2 (0 and 1 for the plain linear arm on `z5` and `z8`). Every network has 64 channels per layer and 592,764 parameters (`LocalizationNet` in `src/piml/network.py`).
+```
+--input FILE             Corpus HDF5 or .npz with C66, or voxels and C_grain (Pa, Mandel notation)
+--generate SEED          Build a random volume the way the corpus does, instead of --input
+--n                      Grid size for --generate (default: 32)
+--ngrain                 Grain count for --generate (default: n^3 // 20)
+--material               Cubic constants for --generate: Cu | Z5 | Z8 (default: Cu)
+--c C11 C12 C44          Cubic constants in GPa; override --material
+--project                Equilibrium projection: auto | none | eq; auto follows the checkpoint (default: auto)
+--strain EXX ... EXZ     Macroscopic strain, tensor shear
+--stress SXX ... SXZ     Macroscopic stress in Pa, applied through the effective stiffness <A>
+--load CASE MAGNITUDE    Named load: uniaxial-stress-x, shear-xy, biaxial-xy, hydrostatic, ...; Pa for stress cases
+--homogenize             Whose <A> turns a stress load into a strain: prediction | label (default: prediction)
+--measures               Stress measures from xx yy zz xy yz xz vm p s1 s2 s3 tau (default: vm and the largest mean component)
+--plot DIR               Write slice, distribution and cube PNGs per measure
+--vtk FILE.vti           Write the stress field for ParaView
+--out FILE.npz           Write A, and sigma and E_bar with a load
+--device                 cpu | cuda (default: cpu)
+--threads                Torch CPU threads (default: torch's choice)
+```
 
-- Use the checkpoint of your volume's material. The file does not record it, and a mismatch raises no error.
-- A `-proj` checkpoint's raw output is not its prediction. `piml.infer` applies the projection by default; `piml.score` needs `--project eq`.
-- The checkpoints were trained on $32^3$ volumes with about 20 voxels per grain; use volumes like these.
+### Training
 
-## Training
-
-Training needs an NVIDIA GPU and the corpus in `data/periodic32/<corpus>/`, regenerated with [tools/README.md](tools/README.md). The released checkpoints used, per arm (`--linear` for the linear one, `--project-train` for `-proj`, `--which z5` or `z8` for the other corpora):
+Needs an NVIDIA GPU and the corpus in `data/periodic32/<corpus>/`. The recipe of the released checkpoints:
 
 ```bash
 python -m piml.periodic sweep --which cu --rf 13 --width 64 --augment --norm none --max-steps 36000 --patience 6000 --sched-patience 20 --seeds 0 1 2
 ```
 
-The defaults of these flags differ from the recipe, so pass all of them. Each run appends a row to `logs/results.jsonl` and saves its best-validation weights under `checkpoints/`. The first run of a corpus writes a 1.49 GB cache under `scratch/`. A nonlinear run took about 135 min on an RTX 4070 Laptop GPU (8 GB). cuDNN is nondeterministic, so reruns do not reproduce bitwise. [tools/queues/train_example.sh](tools/queues/train_example.sh) queues runs in the background.
+Add `--linear` for the linear arm, `--project-train` to train through the projection, and `--which z5` or `z8` for the other corpora. Each run saves its weights under `checkpoints/` and appends a row to `logs/results.jsonl`. [tools/queues/train_example.sh](tools/queues/train_example.sh) queues runs in the background.
 
-## Data
+### Scoring
 
-Each corpus holds 200 volumes, one HDF5 file each, 3.02 GB for all three. They share seeds 1000 to 1199, so grain shapes and orientations are identical across materials. Seeds 1000 to 1139 are for training, 1140 to 1159 for validation and 1160 to 1199 for testing. The labels come from six solves per volume with the Moulinec-Suquet FFT solver of [MatViz3D](https://github.com/MME-NTU-KhPI/MatViz3D) at tolerance $10^{-5}$.
+```bash
+python -m piml.score --ckpt weights/cu-nonlinear-rf13-w64-s0-proj.pt --which cu --project eq
+```
 
-The corpora have no public copy yet. [tools/README.md](tools/README.md) regenerates them in about 1 to 2 hours per corpus on 12 cores.
+Needs the corpus; `--project eq` for `-proj` checkpoints.
 
-## Modules
+### Data generation
 
-| module | purpose |
+Needs the MatViz3D clone from [docs/INSTALL.md](docs/INSTALL.md#set-up-data-generation) and g++ with OpenMP.
+
+```bash
+tools/build_mesh_refine.sh                   # build the solver driver
+python -m piml.mesh_convergence smoke        # check it against known answers
+python -m piml.corpus gen --first 1000 --count 200 --material Cu --out data/periodic32/cu
+python -m piml.corpus check data/periodic32/cu
+```
+
+The Zener 5 and Zener 8 corpora need `--c` and a higher `--maxit`; [tools/README.md](tools/README.md) has the exact commands.
+
+## Documentation
+
+| Document | Covers |
 |---|---|
-| `infer` | predict $\mathbf{A}(\mathbf{x})$ for one volume, apply a load, plot, export VTK |
-| `loading`, `fields`, `viz` | loads, stress measures and plots used by `infer` |
-| `network`, `microstructure`, `physics` | the network, crystal stiffness and Mandel conversions, the equilibrium projection |
-| `periodic` | training (`sweep`) and the ridge baseline (`ridge`) |
-| `score` | test error of a checkpoint |
-| `affine_lsqr`, `born` | untrained baselines: the best linear kernel and the solver's iterates |
-| `corpus`, `mesh_convergence` | corpus generation and checks, solver smoke test and resolution ladder |
-| `paths` | default paths, each overridable by an environment variable (`PIML_DATA`, `PIML_SCRATCH` and others) |
-
+| [Installation](docs/INSTALL.md) | Environments, GPU build, weights download, MatViz3D clone, path variables |
+| [Inference](docs/INFERENCE.md) | Choosing a checkpoint, loads, stress measures, plots, Python API, scoring |
+| [Data format](docs/DATA.md) | Input requirements, Mandel notation, output and corpus file layouts |
+| [Data generation](tools/README.md) | Solver driver, regenerating and checking the corpora, resolution ladder |
 
 ## License
 
