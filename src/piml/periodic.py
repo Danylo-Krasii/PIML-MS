@@ -20,6 +20,7 @@ constant tensor, the Taylor field A = C(x), and the Born iterates of orders 1 to
 """
 
 import argparse
+import copy
 import datetime as _dt
 import json
 import socket
@@ -112,7 +113,7 @@ def train(C, A, rf, tr, va, te, width=64, linear=True, norm="none", seed=0,
           max_steps=12000, patience_steps=3000, lr=1e-3, batch=8, dev="cuda", quiet=False,
           grad_clip=1.0, sched_patience=5, tag=None, rewind=3.0, max_rewinds=5,
           augment=False, lam=0.0, balance="none", balance_every=100, balance_alpha=0.9,
-          balance_lr=None, project_train=False):
+          balance_lr=None, project_train=False, balance_cap=None, balance_warmup=0):
     """Returns a dict of results. Scored on the whole cell.
 
     Keys: err, params, steps, secs, best_step, nonfinite, rewinds, clipped, ckpt, and the recipe
@@ -137,6 +138,19 @@ def train(C, A, rf, tr, va, te, width=64, linear=True, norm="none", seed=0,
     prediction is projected onto spectral equilibrium in the data frame and the data loss, the
     validation error and the test error are taken on the projected field; no penalty is added.
     The rewind guard, early stopping and the scheduler read the data error in every mode.
+
+    balance_cap bounds the adaptive weight (the gradient-norm weight, or exp(s_d - s_p) under
+    "uncertainty"); balance_warmup ramps the gradient-norm weight linearly from zero over that
+    many steps (it can start orders of magnitude above its later value). Both are off by default, which
+    keeps the recorded runs reproducible.
+
+    A rewind restores the network, the log-variances or gradient-norm weight, the AdamW moments
+    and the scheduler as they were at the best step, then halves the network's learning rate
+    only; the adaptive weights are clipped with their own call, and the final weights are saved
+    beside the best ones. Earlier versions halved every group and restored the network alone;
+    rows trained with them used that guard, so
+    a run that rewinds, and every "uncertainty" run (its log-variances are now clipped), does not
+    reproduce its step-1 row. Runs that never rewind in the other modes are unchanged.
     """
     import torch
     import torch.nn as nn
@@ -168,6 +182,7 @@ def train(C, A, rf, tr, va, te, width=64, linear=True, norm="none", seed=0,
         s = torch.zeros(2, device=dev, requires_grad=True)
         groups.append({"params": [s], "lr": 10 * lr if balance_lr is None else balance_lr})
     opt = torch.optim.AdamW(groups, lr=lr, weight_decay=0.0)
+    balance_lr_start = opt.param_groups[-1]["lr"] if s is not None else None
     # ReduceLROnPlateau halves on the call AFTER patience consecutive non-improving ones,
     # so it needs (sched_patience + 1) * 100 stalled steps. Early stopping must outlive that
     # or the schedule never fires. min_lr stops the rate decaying to nothing.
@@ -199,9 +214,11 @@ def train(C, A, rf, tr, va, te, width=64, linear=True, norm="none", seed=0,
             trace = d / f"{tag}-{k}.jsonl"
             k += 1
 
-    nonfinite, clipped = 0, 0
+    nonfinite, clipped, clipped_adaptive = 0, 0, 0
     best, best_state, bad, step, stop = float("inf"), None, 0, 0, False
     best_step, rewinds = 0, 0
+    best_opt, best_sched, best_lam_state, s_after_rewind = None, None, None, None
+    lam_applied = None
     last_eq, last_mse, last_r2, lam_eff, best_lam, best_s = None, None, None, None, None, None
     pars = [q for q in net.parameters() if q.requires_grad]
     t0 = _time.time()
@@ -242,7 +259,10 @@ def train(C, A, rf, tr, va, te, width=64, linear=True, norm="none", seed=0,
                                    / torch.linalg.vector_norm(gp).clamp_min(1e-30)).item()
                         lam_eff = (lam_hat if lam_eff is None
                                    else balance_alpha * lam_eff + (1 - balance_alpha) * lam_hat)
-                    loss = mse + lam_eff * r2m
+                        if balance_cap is not None:
+                            lam_eff = min(lam_eff, balance_cap)
+                    lam_applied = lam_eff * (min(1.0, step / balance_warmup) if balance_warmup else 1.0)
+                    loss = mse + lam_applied * r2m
                 else:
                     loss = mse + lam * r2m
                 last_eq = r2.detach().sqrt().mean()
@@ -250,10 +270,16 @@ def train(C, A, rf, tr, va, te, width=64, linear=True, norm="none", seed=0,
             last_mse = mse.detach()
             loss.backward()
             gn = nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
-            if torch.isfinite(gn):
+            gs = nn.utils.clip_grad_norm_([s], grad_clip) if s is not None else None
+            if torch.isfinite(gn) and (gs is None or torch.isfinite(gs)):
                 opt.step()
                 if gn > grad_clip:
                     clipped += 1
+                if gs is not None and gs > grad_clip:
+                    clipped_adaptive += 1
+                if s is not None and balance_cap is not None:
+                    with torch.no_grad():         # keep exp(s_d - s_p) at or below the cap
+                        s[1].clamp_(min=float(s[0]) - float(np.log(balance_cap)))
             else:
                 nonfinite += 1
             step += 1
@@ -265,10 +291,24 @@ def train(C, A, rf, tr, va, te, width=64, linear=True, norm="none", seed=0,
                 # take smaller steps from there. It is a no-op for a run that never spikes.
                 if (best_state is not None and rewinds < max_rewinds
                         and (not np.isfinite(v) or v > rewind * best)):
+                    lr_now = opt.param_groups[0]["lr"]
                     net.load_state_dict(best_state)
-                    for pg in opt.param_groups:
-                        pg["lr"] = max(pg["lr"] * 0.5, 1e-5)
+                    opt.load_state_dict(best_opt)        # moments and group rates at the best step
+                    sched.load_state_dict(best_sched)
+                    if s is not None:
+                        with torch.no_grad():
+                            s.copy_(best_lam_state)
+                        s_after_rewind = s.detach().tolist()
+                    elif balance == "gradnorm":
+                        lam_eff = best_lam_state
+                    pg = opt.param_groups[0]              # only the network takes smaller steps,
+                    pg["lr"] = max(min(pg["lr"], lr_now) * 0.5, 1e-5)   # halving again per rewind
                     rewinds += 1
+                    if trace is not None:
+                        with open(trace, "a") as fh:
+                            fh.write(json.dumps({"step": step, "event": "rewind", "val": v,
+                                                 "best": best, "best_step": best_step,
+                                                 "lr": pg["lr"]}) + "\n")
                     if not quiet:
                         print(f"      step {step:6d}: val {v:.4g} is {v/best:.1f}x best {best:.4f}; "
                               f"rewound to best, lr now {opt.param_groups[0]['lr']:.2e} "
@@ -279,6 +319,9 @@ def train(C, A, rf, tr, va, te, width=64, linear=True, norm="none", seed=0,
                 if v < best - 1e-5:
                     best, bad, best_step = v, 0, step
                     best_state = {k: t.detach().clone() for k, t in net.state_dict().items()}
+                    best_opt = copy.deepcopy(opt.state_dict())
+                    best_sched = copy.deepcopy(sched.state_dict())
+                    best_lam_state = (s.detach().clone() if s is not None else lam_eff)
                     best_lam = float(lam_eff) if lam_eff is not None else None
                     best_s = s.detach().tolist() if s is not None else None
                 else:
@@ -302,10 +345,13 @@ def train(C, A, rf, tr, va, te, width=64, linear=True, norm="none", seed=0,
                             fh.write(json.dumps({"step": step, "val": v, "mse": float(last_mse),
                                                  "r2": float(last_r2) if last_r2 is not None else None,
                                                  "lam_eff": w,
+                                                 "lam_applied": (float(lam_applied)
+                                                                 if lam_applied is not None else None),
                                                  "s": s.detach().tolist() if s is not None else None,
                                                  "lr": opt.param_groups[0]["lr"]}) + "\n")
                 if bad >= patience_steps:
                     stop = True; break
+    final_state = {k: t.detach().clone() for k, t in net.state_dict().items()}
     net.load_state_dict(best_state)
     if nonfinite and not quiet:
         print(f"      {nonfinite} non-finite gradient steps skipped", flush=True)
@@ -319,7 +365,7 @@ def train(C, A, rf, tr, va, te, width=64, linear=True, norm="none", seed=0,
         while ckpt.exists():
             ckpt = d / f"{tag}-{k}.pt"
             k += 1
-        torch.save({"state": best_state, "rf": rf, "width": width, "linear": linear,
+        torch.save({"state": best_state, "final_state": final_state, "rf": rf, "width": width, "linear": linear,
                     "norm": norm, "seed": seed, "cin": C.shape[-1], "best_step": best_step,
                     "xm": xm.cpu(), "xs": xs.cpu(), "ym": ym.cpu(), "ys": ys.cpu(),
                     "balance": balance, "lam_eff": best_lam, "project_train": project_train}, ckpt)
@@ -327,6 +373,10 @@ def train(C, A, rf, tr, va, te, width=64, linear=True, norm="none", seed=0,
     if balance != "none":
         extra.update(balance=balance, balance_every=balance_every, balance_alpha=balance_alpha,
                      balance_lr=opt.param_groups[-1]["lr"] if s is not None else None,
+                     balance_lr_start=balance_lr_start, balance_cap=balance_cap,
+                     balance_warmup=balance_warmup, clipped_adaptive=clipped_adaptive,
+                     s_after_last_rewind=s_after_rewind,
+                     opt_restored=bool(rewinds) if best_opt is not None else None,
                      lam_eff=best_lam, s_data=best_s[0] if best_s else None,
                      s_phys=best_s[1] if best_s else None)
     if lam > 0 or balance != "none":
@@ -444,7 +494,9 @@ def sweep(a):
                       quiet=False, augment=a.augment, lam=lam, balance=bal,
                       balance_every=getattr(a, "balance_every", 100),
                       balance_alpha=getattr(a, "balance_alpha", 0.9),
-                      balance_lr=getattr(a, "balance_lr", None), project_train=proj, **kw,
+                      balance_lr=getattr(a, "balance_lr", None), project_train=proj,
+                      balance_cap=getattr(a, "balance_cap", None),
+                      balance_warmup=getattr(a, "balance_warmup", 0), **kw,
                       tag=f"{a.which}-{arm}-rf{rf}-w{w}-s{s_}-{a.norm}" + suffix)
             e, steps, secs = r["err"], r["steps"], r["secs"]
             record(arm=arm, which=a.which, rf=rf, seed=s_, width=w, norm=a.norm,
@@ -485,6 +537,10 @@ def main():
     ap.add_argument("--balance-lr", type=float, default=None,
                     help="learning rate of the two log-variances under --balance uncertainty; ten times "
                          "the network's when unset")
+    ap.add_argument("--balance-cap", type=float, default=None,
+                    help="upper bound on the adaptive weight (gradnorm weight, or exp(s_d - s_p)); off by default")
+    ap.add_argument("--balance-warmup", type=int, default=0,
+                    help="steps over which the gradient-norm weight ramps up from zero; 0 turns it off")
     ap.add_argument("--project-train", action="store_true",
                     help="train, validate and test on the prediction projected onto spectral equilibrium "
                          "(sweep only)")
